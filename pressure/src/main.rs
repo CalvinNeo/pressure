@@ -1,4 +1,5 @@
 #![feature(iter_intersperse)]
+#![feature(iter_array_chunks)]
 use std::{
     borrow::BorrowMut,
     collections::HashMap,
@@ -95,12 +96,17 @@ impl<T: Clone + Sync + 'static> Feeder<T> {
         }
         let expect_len = slot_count * slot_size;
         println!("start prefetch of total {}", expect_len);
-        let prefetched = feeder.sampler.as_ref().sample(expect_len, true);
+        let prefetched: Vec<T> = feeder.sampler.as_ref().sample(expect_len, true);
         println!("finished prefetch of total {}", prefetched.len());
+        let mut iter = prefetched.into_iter();
         for i in 0..slot_count {
             println!("start create slot {}", i);
-            let slot =
-                Slot::new_with_prefetched(prefetched[i * slot_size..(i + 1) * slot_size].to_vec());
+            let mut v: Vec<T> = vec![];
+            v.reserve(slot_size);
+            for _j in 0..slot_size {
+                v.push(iter.next().unwrap());
+            }
+            let slot = Slot::new_with_prefetched(v);
             *feeder.slots[i].write().expect("update lock error") = slot;
         }
         feeder
@@ -267,11 +273,19 @@ impl MySQLIssuer {
                         }
                     } else {
                         if !conns.contains_key(&tidb_id) {
+                            println!(
+                                "thread_id {} start connect to tidb_id {}",
+                                thread_id, tidb_id
+                            );
                             conns.insert(
                                 tidb_id,
                                 pools.read().expect("read lock")[tidb_id]
                                     .get_conn()
                                     .unwrap(),
+                            );
+                            println!(
+                                "thread_id {} finish connect to tidb_id {}",
+                                thread_id, tidb_id
                             );
                         }
                         conns
@@ -343,7 +357,7 @@ fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
     Ok(receiver)
 }
 
-/// ./target/debug/pressure --dry-run --tidb-addrs mysql://root@127.0.0.1:4000/ --input-files /Users/calvin/pressure/pressure/a,/Users/calvin/pressure/pressure/b,/Users/calvin/pressure/pressure/c -s 1000 --update-interval-millis 100
+/// ./target/release/pressure --tidb-addrs mysql://root@172.31.7.1:4000/,mysql://root@172.31.7.2:4000/,mysql://root@172.31.7.3:4000/,mysql://root@172.31.7.4:4000/ --input-files /home/ubuntu/tiflash-u2/pk_0,/home/ubuntu/tiflash-u2/pk_1,/home/ubuntu/tiflash-u2/pk_2,/home/ubuntu/tiflash-u2/pk_3,/home/ubuntu/tiflash-u2/pk_4,/home/ubuntu/tiflash-u2/pk_5 -s 2000000 --update-interval-millis 5000 --batch-size 1 --slot-count 100  --workers 100
 fn main() {
     let args = PKIssueArgs::parse();
     let file_names = args.input_files.split(",").map(|e| e.to_string()).collect();
