@@ -1,15 +1,23 @@
 use std::{
     fs::File,
+    future::Future,
     io::{self, BufRead, BufReader},
-    sync::{atomic::AtomicBool, Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, AtomicU64},
+        Arc, RwLock,
+    },
     thread::{self, JoinHandle},
 };
 
 use clap::Parser;
+use crossbeam::epoch::Atomic;
 use crossbeam_channel::{bounded, select, Receiver};
 use mysql::{prelude::*, *};
 use rand::{prelude::IteratorRandom, Rng};
 use threadpool::ThreadPool;
+use tokio::{runtime::Runtime, sync::oneshot};
+
+const STEP: u64 = 100;
 
 trait Sampler<T: Clone + Sync>: Send + Sync {
     fn sample(&self, n: usize, _: bool) -> Vec<T>;
@@ -59,7 +67,7 @@ struct Feeder<T: Clone + Sync> {
 
 unsafe impl<T: Clone + Sync> Send for Feeder<T> {}
 
-impl<T: Clone + Sync> Feeder<T> {
+impl<T: Clone + Sync + 'static> Feeder<T> {
     fn new(
         slot_count: usize,
         slot_size: usize,
@@ -90,7 +98,9 @@ impl<T: Clone + Sync> Feeder<T> {
     }
 
     fn update_cell(&self, i: usize) -> usize {
-        let slot = Slot::new(self.sampler.clone(), self.slot_size);
+        let slot_size = self.slot_size.clone();
+        let sampler = self.sampler.clone();
+        let slot = Slot::new(sampler, slot_size);
         let size = slot.items.len();
         *self.slots[i].write().expect("update lock error") = slot;
         size
@@ -108,35 +118,22 @@ impl<T: Clone + Sync> Feeder<T> {
     }
 }
 
-fn background_update<T: Clone + Sync + 'static>(
-    feeder: Arc<Feeder<T>>,
-) -> (Arc<AtomicBool>, JoinHandle<()>) {
-    let finished = Arc::new(AtomicBool::new(false));
-    (
-        finished.clone(),
-        thread::spawn(move || {
-            let finished = finished.clone();
-            let update_millis = feeder.update_millis.clone();
-            let mut rng = rand::thread_rng();
-            loop {
-                if finished.load(std::sync::atomic::Ordering::SeqCst) {
-                    println!("finish");
-                    return;
-                }
-                let slot_id: usize = rng.gen_range(0usize..feeder.slot_count);
-                let now = std::time::Instant::now();
-                println!("start update slot {}", slot_id);
-                let new_size = feeder.update_cell(slot_id);
-                println!(
-                    "end update slot {} elapsed millis {} new_size {}",
-                    slot_id,
-                    now.elapsed().as_millis(),
-                    new_size
-                );
-                thread::sleep(std::time::Duration::from_millis(update_millis));
-            }
-        }),
-    )
+async fn background_update<T: Clone + Sync + 'static>(feeder: Arc<Feeder<T>>) {
+    let update_millis = feeder.update_millis.clone();
+    let mut rng = rand::thread_rng();
+    loop {
+        let slot_id: usize = rng.gen_range(0usize..feeder.slot_count);
+        let now = std::time::Instant::now();
+        println!("start update slot {}", slot_id);
+        let new_size = feeder.update_cell(slot_id);
+        println!(
+            "end update slot {} elapsed millis {} new_size {}",
+            slot_id,
+            now.elapsed().as_millis(),
+            new_size
+        );
+        thread::sleep(std::time::Duration::from_millis(update_millis));
+    }
 }
 
 struct PKSampler {
@@ -195,15 +192,24 @@ struct MySQLIssuer {
     pools: Arc<RwLock<Vec<Pool>>>,
     feeder: Arc<Feeder<String>>,
     dry_run: bool,
+    acc: Arc<AtomicU64>,
+    no_print_data: bool,
 }
 
 impl MySQLIssuer {
-    fn new(urls: Vec<String>, feeder: Arc<Feeder<String>>, dry_run: bool) -> Self {
+    fn new(
+        urls: Vec<String>,
+        feeder: Arc<Feeder<String>>,
+        dry_run: bool,
+        no_print_data: bool,
+    ) -> Self {
         let r = Self {
             urls: urls.clone(),
             pools: Arc::new(RwLock::new(vec![])),
             feeder,
             dry_run,
+            acc: Arc::new(AtomicU64::new(0)),
+            no_print_data,
         };
         if !dry_run {
             for url in urls.iter() {
@@ -224,6 +230,8 @@ impl MySQLIssuer {
             let pools = self.pools.clone();
             let feeder = self.feeder.clone();
             let dry_run = self.dry_run.clone();
+            let no_print_data = self.no_print_data.clone();
+            let acc = self.acc.clone();
             thread_pool.execute(move || {
                 let mut count = 0;
                 loop {
@@ -237,7 +245,9 @@ impl MySQLIssuer {
                     let billcode = feeder.sample(1).into_iter().nth(0).unwrap();
                     let s = format!("update rtdb.zto_ssmx_bill_detail set forecast_stat_day = '{}' where bill_code='{}'", random_string, billcode);
                     if dry_run {
-                        println!("thread_id {} tidb_id {} sql {}", thread_id, tidb_id, s);
+                        if !no_print_data {
+                            println!("thread_id {} tidb_id {} sql {}", thread_id, tidb_id, s);
+                        }
                     } else {
                         let mut conn = pools.read().expect("read lock")[tidb_id].get_conn().unwrap();
                         conn.query_drop(s).unwrap();
@@ -245,6 +255,9 @@ impl MySQLIssuer {
                     count += 1;
                     if count % 10000 == 0 {
                         println!("thread_id {} finished {}", thread_id, count);
+                    }
+                    if count % STEP == 0 {
+                        acc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
             });
@@ -284,6 +297,9 @@ struct PKIssueArgs {
     /// How many items in one slot.
     #[arg(short, long)]
     slot_size: usize,
+
+    #[arg(long, default_value_t = true)]
+    no_print_data: bool,
 }
 
 fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
@@ -306,11 +322,28 @@ fn main() {
         Arc::new(pk),
         args.update_interval_millis,
     ));
-    let (f, j) = background_update(feeder.clone());
+    let rt = Runtime::new().unwrap();
+    let _g = rt.enter();
     let feed = feeder.clone();
 
+    let bg_fut = rt.spawn(background_update(feed));
+
+    let feed = feeder.clone();
     let addrs: Vec<String> = args.tidb_addrs.split(",").map(|e| e.to_string()).collect();
-    let iss: MySQLIssuer = MySQLIssuer::new(addrs, feed, args.dry_run);
+    let iss: MySQLIssuer = MySQLIssuer::new(addrs, feed, args.dry_run, args.no_print_data);
+    let iss_acc = iss.acc.clone();
+    let bg_qps = rt.spawn(async move {
+        let mut prev = 0;
+        loop {
+            let i = std::time::Instant::now();
+            tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+            let c = iss_acc.load(std::sync::atomic::Ordering::SeqCst) * STEP;
+            let d = (c - prev) as f64 / 2.0;
+            prev = c;
+            println!("QPS {}", d / i.elapsed().as_secs_f64());
+        }
+    });
+
     let (f2, thread_pool) = iss.start(args.workers);
 
     let ctrl_c_events = ctrl_channel().unwrap();
@@ -318,10 +351,11 @@ fn main() {
         select! {
             recv(ctrl_c_events) -> _ => {
                 println!("Goodbye!");
-                f.store(true, std::sync::atomic::Ordering::SeqCst);
                 f2.store(true, std::sync::atomic::Ordering::SeqCst);
-                j.join().unwrap();
                 thread_pool.join();
+                bg_fut.abort();
+                bg_qps.abort();
+                rt.shutdown_timeout(std::time::Duration::from_millis(1));
                 println!("Quit!");
                 break;
             }
