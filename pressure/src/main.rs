@@ -272,27 +272,31 @@ impl MySQLIssuer {
                             println!("thread_id {} tidb_id {} sql {}", thread_id, tidb_id, s);
                         }
                     } else {
-                        if !conns.contains_key(&tidb_id) {
-                            println!(
-                                "thread_id {} start connect to tidb_id {}",
-                                thread_id, tidb_id
-                            );
-                            conns.insert(
-                                tidb_id,
-                                pools.read().expect("read lock")[tidb_id]
-                                    .get_conn()
-                                    .unwrap(),
-                            );
-                            println!(
-                                "thread_id {} finish connect to tidb_id {}",
-                                thread_id, tidb_id
-                            );
-                        }
-                        conns
-                            .get_mut(&tidb_id)
-                            .expect("REASON")
-                            .query_drop(s)
+                        // if !conns.contains_key(&tidb_id) {
+                        //     println!(
+                        //         "thread_id {} start connect to tidb_id {}",
+                        //         thread_id, tidb_id
+                        //     );
+                        //     conns.insert(
+                        //         tidb_id,
+                        //         pools.read().expect("read lock")[tidb_id]
+                        //             .get_conn()
+                        //             .unwrap(),
+                        //     );
+                        //     println!(
+                        //         "thread_id {} finish connect to tidb_id {}",
+                        //         thread_id, tidb_id
+                        //     );
+                        // }
+                        // conns
+                        //     .get_mut(&tidb_id)
+                        //     .expect("REASON")
+                        //     .query_drop(s)
+                        //     .unwrap();
+                        let mut conn = pools.read().expect("read lock")[tidb_id]
+                            .get_conn()
                             .unwrap();
+                        conn.query_drop(s).unwrap();
                     }
                     count += 1;
                     if count % 10000 == 0 {
