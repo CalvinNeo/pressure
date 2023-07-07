@@ -370,6 +370,8 @@ fn main() {
 
     let (f2, tvs) = iss.start(args.workers);
 
+    println!("====== thread count {}", tvs.len());
+
     let ctrl_c_events = ctrl_channel().unwrap();
     loop {
         select! {
