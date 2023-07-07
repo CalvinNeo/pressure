@@ -225,9 +225,9 @@ impl MySQLIssuer {
         r
     }
 
-    fn start(&self, n_threads: usize) -> (Arc<AtomicBool>, ThreadPool) {
-        let thread_pool = ThreadPool::with_name("issuer".into(), n_threads);
+    fn start(&self, n_threads: usize) -> (Arc<AtomicBool>, Vec<JoinHandle<()>>) {
         let finished = Arc::new(AtomicBool::new(false));
+        let mut tv: Vec<JoinHandle<()>> = vec![];
         for thid in 0..n_threads {
             let finished = finished.clone();
             let thread_id = thid.clone();
@@ -238,7 +238,7 @@ impl MySQLIssuer {
             let no_print_data = self.no_print_data.clone();
             let acc = self.acc.clone();
             let batch_size = self.batch_size.clone();
-            thread_pool.execute(move || {
+            let f = move || {
                 let mut count = 0;
                 loop {
                     if finished.load(std::sync::atomic::Ordering::SeqCst) {
@@ -267,9 +267,10 @@ impl MySQLIssuer {
                         acc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
-            });
+            };
+            tv.push(thread::spawn(f));
         }
-        (finished, thread_pool)
+        (finished, tv)
     }
 }
 
@@ -360,12 +361,7 @@ fn main() {
         }
     });
 
-    let (f2, thread_pool) = iss.start(args.workers);
-    println!(
-        "===== active/max {}/{}",
-        thread_pool.active_count(),
-        thread_pool.max_count()
-    );
+    let (f2, tvs) = iss.start(args.workers);
 
     let ctrl_c_events = ctrl_channel().unwrap();
     loop {
@@ -373,7 +369,9 @@ fn main() {
             recv(ctrl_c_events) -> _ => {
                 println!("Goodbye!");
                 f2.store(true, std::sync::atomic::Ordering::SeqCst);
-                thread_pool.join();
+                for x in tvs.into_iter() {
+                    let _ = x.join();
+                }
                 bg_fut.abort();
                 bg_qps.abort();
                 rt.shutdown_timeout(std::time::Duration::from_millis(1));
