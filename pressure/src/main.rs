@@ -12,7 +12,7 @@ use rand::{prelude::IteratorRandom, Rng};
 use threadpool::ThreadPool;
 
 trait Sampler<T: Clone + Sync>: Send + Sync {
-    fn sample(&self, n: usize) -> Vec<T>;
+    fn sample(&self, n: usize, _: bool) -> Vec<T>;
 }
 struct Slot<T: Clone + Sync> {
     items: Vec<T>,
@@ -29,7 +29,14 @@ impl<T: Clone + Sync> Default for Slot<T> {
 impl<T: Clone + Sync> Slot<T> {
     fn new(sampler: Arc<dyn Sampler<T>>, size: usize) -> Slot<T> {
         let mut s = Slot::default();
-        s.items.append(&mut sampler.sample(size));
+        s.items.append(&mut sampler.sample(size, false));
+        s
+    }
+
+    fn new_with_prefetched(prefetched: Vec<T>) -> Slot<T> {
+        let mut s = Slot::default();
+        let mut prefetched = prefetched;
+        s.items.append(&mut prefetched);
         s
     }
 
@@ -69,8 +76,15 @@ impl<T: Clone + Sync> Feeder<T> {
         for _i in 0..slot_count {
             feeder.slots.push(RwLock::new(Slot::default()));
         }
+        let expect_len = slot_count * slot_size;
+        println!("start prefetch of total {}", expect_len);
+        let prefetched = feeder.sampler.as_ref().sample(expect_len, true);
+        println!("finished prefetch of total {}", prefetched.len());
         for i in 0..slot_count {
-            feeder.update_cell(i);
+            println!("start create slot {}", i);
+            let slot =
+                Slot::new_with_prefetched(prefetched[i * slot_size..(i + 1) * slot_size].to_vec());
+            *feeder.slots[i].write().expect("update lock error") = slot;
         }
         feeder
     }
@@ -85,6 +99,7 @@ impl<T: Clone + Sync> Feeder<T> {
     fn sample(&self, n: usize) -> Vec<T> {
         let mut rng = rand::thread_rng();
         let slot_id: usize = rng.gen_range(0usize..self.slot_count);
+        // We don't sample more than a slots's maximum items.
         assert!(n <= self.slot_count);
         self.slots[slot_id]
             .read()
@@ -140,7 +155,7 @@ fn read_lines_lazy(file_path: &str) -> impl Iterator<Item = io::Result<String>> 
 }
 
 impl Sampler<String> for PKSampler {
-    fn sample(&self, n: usize) -> Vec<String> {
+    fn sample(&self, n: usize, should_print: bool) -> Vec<String> {
         // Reservoir Sampling
         let mut res: Vec<String> = vec![];
         let mut iter_set: Vec<Box<dyn Iterator<Item = io::Result<String>>>> = vec![];
@@ -154,7 +169,9 @@ impl Sampler<String> for PKSampler {
         let mut c: usize = 0;
         for s in final_iter {
             let s = s.unwrap();
-            // println!("see {} sample n = {}", s, n);
+            if should_print && c % 1000000 == 0 {
+                println!("sampler load {}", c);
+            }
             if c < n {
                 res.push(s);
             } else {
