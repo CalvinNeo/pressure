@@ -53,8 +53,12 @@ impl<T: Clone + Sync> Slot<T> {
     fn sample(&self, n: usize) -> Vec<T> {
         assert!(n <= self.items.len());
         let mut rng = rand::thread_rng();
-        let v: Vec<&T> = self.items.iter().choose_multiple(&mut rng, n);
-        let v: Vec<T> = v.into_iter().map(|e| e.clone()).collect();
+        let mut v: Vec<T> = vec![];
+        v.reserve(n);
+        for i in 0..n {
+            let j: usize = rng.gen_range(0usize..self.items.len());
+            v.push(self.items[j].clone());
+        }
         v
     }
 }
@@ -247,7 +251,8 @@ impl MySQLIssuer {
                     let mut rng = rand::thread_rng();
                     let tidb_id: usize = rng.gen_range(0usize..urls.len());
                     // Let's create a table for payments.
-                    let random_string: String = (0..5).map(|_| rng.gen_range(b'a'..=b'z') as char).collect();
+                    let random_string: String =
+                        (0..5).map(|_| rng.gen_range(b'a'..=b'z') as char).collect();
                     let s: String = Iterator::intersperse(feeder.sample(batch_size as usize).into_iter().map(|e| {
                         format!("update rtdb.zto_ssmx_bill_detail set forecast_stat_day = '{}' where bill_code='{}';", random_string, e)
                     }), "\n".to_string()).collect();
@@ -256,7 +261,9 @@ impl MySQLIssuer {
                             println!("thread_id {} tidb_id {} sql {}", thread_id, tidb_id, s);
                         }
                     } else {
-                        let mut conn = pools.read().expect("read lock")[tidb_id].get_conn().unwrap();
+                        let mut conn = pools.read().expect("read lock")[tidb_id]
+                            .get_conn()
+                            .unwrap();
                         conn.query_drop(s).unwrap();
                     }
                     count += 1;
