@@ -1,3 +1,4 @@
+#![feature(iter_intersperse)]
 use std::{
     fs::File,
     future::Future,
@@ -12,6 +13,7 @@ use std::{
 use clap::Parser;
 use crossbeam::epoch::Atomic;
 use crossbeam_channel::{bounded, select, Receiver};
+use itertools::Itertools;
 use mysql::{prelude::*, *};
 use rand::{prelude::IteratorRandom, Rng};
 use threadpool::ThreadPool;
@@ -194,6 +196,7 @@ struct MySQLIssuer {
     dry_run: bool,
     acc: Arc<AtomicU64>,
     no_print_data: bool,
+    batch_size: u64,
 }
 
 impl MySQLIssuer {
@@ -202,6 +205,7 @@ impl MySQLIssuer {
         feeder: Arc<Feeder<String>>,
         dry_run: bool,
         no_print_data: bool,
+        batch_size: u64,
     ) -> Self {
         let r = Self {
             urls: urls.clone(),
@@ -210,6 +214,7 @@ impl MySQLIssuer {
             dry_run,
             acc: Arc::new(AtomicU64::new(0)),
             no_print_data,
+            batch_size,
         };
         if !dry_run {
             for url in urls.iter() {
@@ -232,6 +237,7 @@ impl MySQLIssuer {
             let dry_run = self.dry_run.clone();
             let no_print_data = self.no_print_data.clone();
             let acc = self.acc.clone();
+            let batch_size = self.batch_size.clone();
             thread_pool.execute(move || {
                 let mut count = 0;
                 loop {
@@ -242,8 +248,9 @@ impl MySQLIssuer {
                     let tidb_id: usize = rng.gen_range(0usize..urls.len());
                     // Let's create a table for payments.
                     let random_string: String = (0..5).map(|_| rng.gen_range(b'a'..=b'z') as char).collect();
-                    let billcode = feeder.sample(1).into_iter().nth(0).unwrap();
-                    let s = format!("update rtdb.zto_ssmx_bill_detail set forecast_stat_day = '{}' where bill_code='{}'", random_string, billcode);
+                    let s: String = Iterator::intersperse(feeder.sample(batch_size as usize).into_iter().map(|e| {
+                        format!("update rtdb.zto_ssmx_bill_detail set forecast_stat_day = '{}' where bill_code='{}';", random_string, e)
+                    }), "\n".to_string()).collect();
                     if dry_run {
                         if !no_print_data {
                             println!("thread_id {} tidb_id {} sql {}", thread_id, tidb_id, s);
@@ -298,8 +305,11 @@ struct PKIssueArgs {
     #[arg(short, long)]
     slot_size: usize,
 
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = false)]
     no_print_data: bool,
+
+    #[arg(long, default_value_t = 1)]
+    batch_size: u64,
 }
 
 fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
@@ -330,7 +340,13 @@ fn main() {
 
     let feed = feeder.clone();
     let addrs: Vec<String> = args.tidb_addrs.split(",").map(|e| e.to_string()).collect();
-    let iss: MySQLIssuer = MySQLIssuer::new(addrs, feed, args.dry_run, args.no_print_data);
+    let iss: MySQLIssuer = MySQLIssuer::new(
+        addrs,
+        feed,
+        args.dry_run,
+        args.no_print_data,
+        args.batch_size,
+    );
     let iss_acc = iss.acc.clone();
     let bg_qps = rt.spawn(async move {
         let mut prev = 0;
@@ -345,6 +361,11 @@ fn main() {
     });
 
     let (f2, thread_pool) = iss.start(args.workers);
+    println!(
+        "===== active/max {}/{}",
+        thread_pool.active_count(),
+        thread_pool.max_count()
+    );
 
     let ctrl_c_events = ctrl_channel().unwrap();
     loop {
