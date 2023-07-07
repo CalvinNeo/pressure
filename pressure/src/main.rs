@@ -1,5 +1,8 @@
 #![feature(iter_intersperse)]
 use std::{
+    borrow::BorrowMut,
+    collections::HashMap,
+    default,
     fs::File,
     future::Future,
     io::{self, BufRead, BufReader},
@@ -244,12 +247,14 @@ impl MySQLIssuer {
             let batch_size = self.batch_size.clone();
             let f = move || {
                 let mut count = 0;
+                let mut conns: HashMap<usize, PooledConn> = Default::default();
                 loop {
                     if finished.load(std::sync::atomic::Ordering::SeqCst) {
                         break;
                     }
                     let mut rng = rand::thread_rng();
                     let tidb_id: usize = rng.gen_range(0usize..urls.len());
+
                     // Let's create a table for payments.
                     let random_string: String =
                         (0..5).map(|_| rng.gen_range(b'a'..=b'z') as char).collect();
@@ -261,10 +266,19 @@ impl MySQLIssuer {
                             println!("thread_id {} tidb_id {} sql {}", thread_id, tidb_id, s);
                         }
                     } else {
-                        let mut conn = pools.read().expect("read lock")[tidb_id]
-                            .get_conn()
+                        if !conns.contains_key(&tidb_id) {
+                            conns.insert(
+                                tidb_id,
+                                pools.read().expect("read lock")[tidb_id]
+                                    .get_conn()
+                                    .unwrap(),
+                            );
+                        }
+                        conns
+                            .get_mut(&tidb_id)
+                            .expect("REASON")
+                            .query_drop(s)
                             .unwrap();
-                        conn.query_drop(s).unwrap();
                     }
                     count += 1;
                     if count % 10000 == 0 {
