@@ -19,7 +19,7 @@ use rand::{prelude::IteratorRandom, Rng};
 use threadpool::ThreadPool;
 use tokio::{runtime::Runtime, sync::oneshot};
 
-const STEP: u64 = 100;
+const STEP: u64 = 20;
 
 trait Sampler<T: Clone + Sync>: Send + Sync {
     fn sample(&self, n: usize, _: bool) -> Vec<T>;
@@ -360,9 +360,9 @@ fn main() {
         let mut prev = 0;
         loop {
             let i = std::time::Instant::now();
-            tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
             let c = iss_acc.load(std::sync::atomic::Ordering::SeqCst) * STEP;
-            let d = (c - prev) as f64 / 2.0;
+            let d = (c - prev) as f64 / 5.0;
             prev = c;
             println!("QPS {}", d / i.elapsed().as_secs_f64());
         }
