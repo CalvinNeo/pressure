@@ -58,6 +58,7 @@ impl<T: Clone + Sync> Slot<T> {
         assert!(n <= self.items.len());
         let mut rng = rand::thread_rng();
         let mut v: Vec<T> = vec![];
+        // We don't use iter().choose_multiple() since it is O(n).
         v.reserve(n);
         for i in 0..n {
             let j: usize = rng.gen_range(0usize..self.items.len());
@@ -191,7 +192,9 @@ impl Sampler<String> for PKSampler {
                 let mut rng = rand::thread_rng();
                 let random_float: f64 = rng.gen_range(0.0..1.0);
                 if random_float > survive {
-                    // Not Survive, Replace a random one.
+                    // Not Survive
+                } else {
+                    // Survive, Replace a random one.
                     let index = rng.gen_range(0..res.len());
                     res[index] = s;
                 }
@@ -361,7 +364,8 @@ fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
     Ok(receiver)
 }
 
-/// ./target/release/pressure --tidb-addrs mysql://root@172.31.7.1:4000/,mysql://root@172.31.7.2:4000/,mysql://root@172.31.7.3:4000/,mysql://root@172.31.7.4:4000/ --input-files /home/ubuntu/tiflash-u2/pk_0,/home/ubuntu/tiflash-u2/pk_1,/home/ubuntu/tiflash-u2/pk_2,/home/ubuntu/tiflash-u2/pk_3,/home/ubuntu/tiflash-u2/pk_4,/home/ubuntu/tiflash-u2/pk_5 -s 2000000 --update-interval-millis 5000 --batch-size 1 --slot-count 100  --workers 100
+/// Consider b regions and k samples, then estimation of coverred regions is b * (1 - ((b - 1) / b) ** k).
+/// ./target/release/pressure --tidb-addrs mysql://root@172.31.7.1:4000/,mysql://root@172.31.7.2:4000/,mysql://root@172.31.7.3:4000/,mysql://root@172.31.7.4:4000/ --input-files /home/ubuntu/tiflash-u2/pk_0,/home/ubuntu/tiflash-u2/pk_1,/home/ubuntu/tiflash-u2/pk_2,/home/ubuntu/tiflash-u2/pk_3,/home/ubuntu/tiflash-u2/pk_4,/home/ubuntu/tiflash-u2/pk_5 -s 5000000 --update-interval-millis 5000 --batch-size 1 --slot-count 50 --workers 100
 fn main() {
     let args = PKIssueArgs::parse();
     let file_names = args.input_files.split(",").map(|e| e.to_string()).collect();
