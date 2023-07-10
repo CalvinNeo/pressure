@@ -1,5 +1,7 @@
 #![feature(iter_intersperse)]
 #![feature(iter_array_chunks)]
+#![feature(async_closure)]
+
 use std::{
     borrow::BorrowMut,
     collections::HashMap,
@@ -8,7 +10,7 @@ use std::{
     future::Future,
     io::{self, BufRead, BufReader},
     sync::{
-        atomic::{AtomicBool, AtomicU64},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize},
         Arc, RwLock,
     },
     thread::{self, JoinHandle},
@@ -18,7 +20,8 @@ use clap::Parser;
 use crossbeam::epoch::Atomic;
 use crossbeam_channel::{bounded, select, Receiver};
 use itertools::Itertools;
-use mysql::{prelude::*, *};
+// use mysql::{prelude::*, *};
+use mysql_async::{prelude::*, *};
 use rand::{prelude::IteratorRandom, Rng};
 use threadpool::ThreadPool;
 use tokio::{runtime::Runtime, sync::oneshot};
@@ -207,7 +210,6 @@ impl Sampler<String> for PKSampler {
 
 struct MySQLIssuer {
     urls: Vec<String>,
-    pools: Arc<RwLock<Vec<Pool>>>,
     feeder: Arc<Feeder<String>>,
     dry_run: bool,
     acc: Arc<AtomicU64>,
@@ -225,81 +227,68 @@ impl MySQLIssuer {
     ) -> Self {
         let r = Self {
             urls: urls.clone(),
-            pools: Arc::new(RwLock::new(vec![])),
             feeder,
             dry_run,
             acc: Arc::new(AtomicU64::new(0)),
             no_print_data,
             batch_size,
         };
-        if !dry_run {
-            for url in urls.iter() {
-                let pool = Pool::new(url.as_str()).unwrap();
-                r.pools.write().expect("update lock").push(pool);
-            }
-        }
         r
     }
 
-    fn start(&self, n_threads: usize) -> (Arc<AtomicBool>, Vec<JoinHandle<()>>) {
-        let finished = Arc::new(AtomicBool::new(false));
-        let mut tv: Vec<JoinHandle<()>> = vec![];
+    fn start(
+        &self,
+        n_threads: usize,
+        rt: &Runtime,
+        finished: Arc<AtomicBool>,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut rv: Vec<tokio::task::JoinHandle<()>> = vec![];
         for thid in 0..n_threads {
-            let finished = finished.clone();
             let thread_id = thid.clone();
             let urls = self.urls.clone();
-            let pools = self.pools.clone();
             let feeder = self.feeder.clone();
             let dry_run = self.dry_run.clone();
             let no_print_data = self.no_print_data.clone();
             let acc = self.acc.clone();
             let batch_size = self.batch_size.clone();
-            let f = move || {
+            let finished = finished.clone();
+            let f = async move || {
                 let mut count = 0;
-                let mut conns: HashMap<usize, PooledConn> = Default::default();
+                let mut pools: Vec<Pool> = vec![];
+                if !dry_run {
+                    for url in urls.iter() {
+                        let pool = Pool::new(url.as_str());
+                        pools.push(pool);
+                    }
+                }
                 loop {
                     if finished.load(std::sync::atomic::Ordering::SeqCst) {
+                        for pool in pools.into_iter() {
+                            pool.disconnect().await;
+                        }
                         break;
                     }
-                    let mut rng = rand::thread_rng();
-                    let tidb_id: usize = rng.gen_range(0usize..urls.len());
-
-                    // Let's create a table for payments.
-                    let random_string: String =
-                        (0..5).map(|_| rng.gen_range(b'a'..=b'z') as char).collect();
-                    let s: String = Iterator::intersperse(feeder.sample(batch_size as usize).into_iter().map(|e| {
-                        format!("update rtdb.zto_ssmx_bill_detail set forecast_stat_day = '{}' where bill_code='{}';", random_string, e)
-                    }), "\n".to_string()).collect();
+                    let (s, tidb_id) = {
+                        // let mut rng_inner = tokio::sync::RwLock::new(rand::thread_rng());
+                        // let rng = rng_inner.read().await;
+                        let mut rng = rand::thread_rng();
+                        let tidb_id: usize = rng.gen_range(0usize..urls.len());
+                        // Let's create a table for payments.
+                        let random_string: String =
+                            (0..5).map(|_| rng.gen_range(b'a'..=b'z') as char).collect();
+                        (Iterator::intersperse(feeder.sample(batch_size as usize).into_iter().map(|e| {
+                            format!("update rtdb.zto_ssmx_bill_detail set forecast_stat_day = '{}' where bill_code='{}';", random_string, e)
+                        }), "\n".to_string()).collect(), tidb_id)
+                    };
                     if dry_run {
                         if !no_print_data {
                             println!("thread_id {} tidb_id {} sql {}", thread_id, tidb_id, s);
                         }
                     } else {
-                        // if !conns.contains_key(&tidb_id) {
-                        //     println!(
-                        //         "thread_id {} start connect to tidb_id {}",
-                        //         thread_id, tidb_id
-                        //     );
-                        //     conns.insert(
-                        //         tidb_id,
-                        //         pools.read().expect("read lock")[tidb_id]
-                        //             .get_conn()
-                        //             .unwrap(),
-                        //     );
-                        //     println!(
-                        //         "thread_id {} finish connect to tidb_id {}",
-                        //         thread_id, tidb_id
-                        //     );
-                        // }
-                        // conns
-                        //     .get_mut(&tidb_id)
-                        //     .expect("REASON")
-                        //     .query_drop(s)
-                        //     .unwrap();
-                        let mut conn = pools.read().expect("read lock")[tidb_id]
-                            .get_conn()
-                            .unwrap();
-                        conn.query_drop(s).unwrap();
+                        let s: String = s;
+                        let mut conn = pools[tidb_id].get_conn().await.unwrap();
+                        conn.query_drop(s).await.unwrap();
+                        drop(conn);
                     }
                     count += 1;
                     if count % 10000 == 0 {
@@ -309,12 +298,23 @@ impl MySQLIssuer {
                         acc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
+                ()
             };
-            tv.push(thread::spawn(f));
+            rv.push(rt.spawn(f()));
         }
-        (finished, tv)
+        rv
     }
 }
+
+// impl Drop for MySQLIssuer {
+//     fn drop(&mut self) {
+//         for pool in self.pools.write().expect("write").into_iter() {
+//             async {
+//                 pool.disconnect().await.unwrap();
+//             }
+//         }
+//     }
+// }
 
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
@@ -355,7 +355,7 @@ struct PKIssueArgs {
     batch_size: u64,
 }
 
-fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
+fn ctrl_channel() -> std::result::Result<Receiver<()>, ctrlc::Error> {
     let (sender, receiver) = bounded(100);
     ctrlc::set_handler(move || {
         let _ = sender.send(());
@@ -366,6 +366,8 @@ fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
 
 /// Consider b regions and k samples, then estimation of coverred regions is b * (1 - ((b - 1) / b) ** k).
 /// ./target/release/pressure --tidb-addrs mysql://root@172.31.7.1:4000/,mysql://root@172.31.7.2:4000/,mysql://root@172.31.7.3:4000/,mysql://root@172.31.7.4:4000/ --input-files /home/ubuntu/tiflash-u2/pk_0,/home/ubuntu/tiflash-u2/pk_1,/home/ubuntu/tiflash-u2/pk_2,/home/ubuntu/tiflash-u2/pk_3,/home/ubuntu/tiflash-u2/pk_4,/home/ubuntu/tiflash-u2/pk_5 -s 5000000 --update-interval-millis 5000 --batch-size 1 --slot-count 50 --workers 100
+/// ./target/debug/pressure --tidb-addrs mysql://root@127.0.0.1:4000/ --input-files /Users/calvin/pressure/pressure/a,/Users/calvin/pressure/pressure/b,/Users/calvin/pressure/pressure/c -s 1 --update-interval-millis 100 --slot-count 1
+
 fn main() {
     let args = PKIssueArgs::parse();
     let file_names = args.input_files.split(",").map(|e| e.to_string()).collect();
@@ -404,9 +406,31 @@ fn main() {
         }
     });
 
-    let (f2, tvs) = iss.start(args.workers);
+    let thread_count = Arc::new(AtomicUsize::new(0));
+    let thread_count_c = thread_count.clone();
+    let rt2 = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.workers)
+        .enable_all()
+        .on_thread_start(move || {
+            thread_count_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .thread_name("issuer")
+        .build()
+        .unwrap();
+    /// The following not works.
+    // let rt2 = tokio::runtime::Builder::new_current_thread()
+    //     .enable_all()
+    //     .build()
+    //     .unwrap();
+    let _g2 = rt.enter();
+    let f2 = Arc::new(AtomicBool::new(false));
+    let tvs = iss.start(args.workers, &rt2, f2.clone());
 
-    println!("====== thread count {}", tvs.len());
+    println!(
+        "====== task count {} exes {} =====",
+        tvs.len(),
+        thread_count.load(std::sync::atomic::Ordering::SeqCst)
+    );
 
     let ctrl_c_events = ctrl_channel().unwrap();
     loop {
@@ -414,12 +438,13 @@ fn main() {
             recv(ctrl_c_events) -> _ => {
                 println!("Goodbye!");
                 f2.store(true, std::sync::atomic::Ordering::SeqCst);
-                for x in tvs.into_iter() {
-                    let _ = x.join();
-                }
                 bg_fut.abort();
                 bg_qps.abort();
+                for k in tvs.into_iter() {
+                    rt2.block_on(k);
+                }
                 rt.shutdown_timeout(std::time::Duration::from_millis(1));
+                rt2.shutdown_timeout(std::time::Duration::from_millis(1));
                 println!("Quit!");
                 break;
             }
