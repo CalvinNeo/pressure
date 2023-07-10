@@ -306,16 +306,6 @@ impl MySQLIssuer {
     }
 }
 
-// impl Drop for MySQLIssuer {
-//     fn drop(&mut self) {
-//         for pool in self.pools.write().expect("write").into_iter() {
-//             async {
-//                 pool.disconnect().await.unwrap();
-//             }
-//         }
-//     }
-// }
-
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -329,8 +319,12 @@ struct PKIssueArgs {
     input_files: String,
 
     /// MySQL workers.
-    #[arg(short, long, default_value_t = 6)]
+    #[arg(short, long, default_value_t = 7)]
     workers: usize,
+
+    /// MySQL tasks.
+    #[arg(short, long, default_value_t = 7)]
+    tasks: usize,
 
     /// Interval to update a random slot.
     #[arg(long, default_value_t = 10000)]
@@ -424,7 +418,7 @@ fn main() {
     //     .unwrap();
     let _g2 = rt.enter();
     let f2 = Arc::new(AtomicBool::new(false));
-    let tvs = iss.start(args.workers, &rt2, f2.clone());
+    let tvs = iss.start(args.tasks, &rt2, f2.clone());
 
     println!(
         "====== task count {} exes {} =====",
