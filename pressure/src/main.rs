@@ -143,7 +143,11 @@ async fn background_update<T: Clone + Sync + 'static>(feeder: Arc<Feeder<T>>) {
     loop {
         let slot_id: usize = rng.gen_range(0usize..feeder.slot_count);
         let now = std::time::Instant::now();
-        println!("start update slot {}", slot_id);
+        println!(
+            "start update slot {} [thread_id={:?}]",
+            slot_id,
+            std::thread::current().id()
+        );
         let new_size = feeder.update_cell(slot_id);
         println!(
             "end update slot {} elapsed millis {} new_size {}",
@@ -283,7 +287,13 @@ impl MySQLIssuer {
                     };
                     if dry_run {
                         if !no_print_data {
-                            println!("thread_id {} tidb_id {} sql {}", thread_id, tidb_id, s);
+                            println!(
+                                "task_id {} tidb_id {} sql {} [thread_id={:?}]",
+                                thread_id,
+                                tidb_id,
+                                s,
+                                std::thread::current().id()
+                            );
                         }
                     } else {
                         let s: String = s;
@@ -293,7 +303,12 @@ impl MySQLIssuer {
                     }
                     count += 1;
                     if count % 10000 == 0 {
-                        println!("thread_id {} finished {}", thread_id, count);
+                        println!(
+                            "task_id {} finished {} [thread_id={:?}]",
+                            thread_id,
+                            count,
+                            std::thread::current().id()
+                        );
                     }
                     if count % STEP == 0 {
                         acc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -373,7 +388,6 @@ fn main() {
         Arc::new(pk),
         args.update_interval_millis,
     ));
-    let rt = Runtime::new().unwrap();
     let addrs: Vec<String> = args.tidb_addrs.split(",").map(|e| e.to_string()).collect();
     let iss: MySQLIssuer = MySQLIssuer::new(
         addrs,
@@ -382,6 +396,7 @@ fn main() {
         args.no_print_data,
         args.batch_size,
     );
+    let rt = Runtime::new().unwrap();
     let iss_acc = iss.acc.clone();
     let (bg_qps, bg_fut) = {
         let _g = rt.enter();
@@ -394,7 +409,11 @@ fn main() {
                 let c = iss_acc.load(std::sync::atomic::Ordering::SeqCst) * STEP;
                 let d = (c - prev) as f64 / 5.0;
                 prev = c;
-                println!("QPS {}", d / i.elapsed().as_secs_f64());
+                println!(
+                    "QPS {} [thread_id={:?}]",
+                    d / i.elapsed().as_secs_f64(),
+                    std::thread::current().id()
+                );
             }
         });
         let bg_fut = rt.spawn(background_update(feed));
