@@ -266,6 +266,8 @@ impl MySQLIssuer {
                         pools.push(pool);
                     }
                 }
+                let mut total_elapsed: u128 = 0;
+                let mut total_elapsed_count: usize = 0;
                 loop {
                     if finished.load(std::sync::atomic::Ordering::SeqCst) {
                         for pool in pools.into_iter() {
@@ -296,19 +298,25 @@ impl MySQLIssuer {
                             );
                         }
                     } else {
+                        let start = std::time::Instant::now();
                         let s: String = s;
                         let mut conn = pools[tidb_id].get_conn().await.unwrap();
                         conn.query_drop(s).await.unwrap();
                         drop(conn);
+                        total_elapsed += start.elapsed().as_millis();
+                        total_elapsed_count += 1;
                     }
                     count += 1;
-                    if count % 10000 == 0 {
+                    if count % 2000 == 0 {
                         println!(
-                            "task_id {} finished {} [thread_id={:?}]",
+                            "task_id {} finished {} average delay {} [thread_id={:?}]",
                             thread_id,
                             count,
+                            total_elapsed as f64 / total_elapsed_count as f64,
                             std::thread::current().id()
                         );
+                        total_elapsed = 0;
+                        total_elapsed_count = 0;
                     }
                     if count % STEP == 0 {
                         acc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
