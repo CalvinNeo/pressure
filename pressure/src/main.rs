@@ -242,6 +242,7 @@ impl MySQLIssuer {
         rt: &Runtime,
         finished: Arc<AtomicBool>,
     ) -> Vec<tokio::task::JoinHandle<()>> {
+        let _g2 = rt.enter();
         let mut rv: Vec<tokio::task::JoinHandle<()>> = vec![];
         for thid in 0..n_threads {
             let thread_id = thid.clone();
@@ -323,7 +324,7 @@ struct PKIssueArgs {
     workers: usize,
 
     /// MySQL tasks.
-    #[arg(short, long, default_value_t = 7)]
+    #[arg(long, default_value_t = 7)]
     tasks: usize,
 
     /// Interval to update a random slot.
@@ -373,32 +374,32 @@ fn main() {
         args.update_interval_millis,
     ));
     let rt = Runtime::new().unwrap();
-    let _g = rt.enter();
-    let feed = feeder.clone();
-
-    let bg_fut = rt.spawn(background_update(feed));
-
-    let feed = feeder.clone();
     let addrs: Vec<String> = args.tidb_addrs.split(",").map(|e| e.to_string()).collect();
     let iss: MySQLIssuer = MySQLIssuer::new(
         addrs,
-        feed,
+        feeder.clone(),
         args.dry_run,
         args.no_print_data,
         args.batch_size,
     );
     let iss_acc = iss.acc.clone();
-    let bg_qps = rt.spawn(async move {
-        let mut prev = 0;
-        loop {
-            let i = std::time::Instant::now();
-            tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
-            let c = iss_acc.load(std::sync::atomic::Ordering::SeqCst) * STEP;
-            let d = (c - prev) as f64 / 5.0;
-            prev = c;
-            println!("QPS {}", d / i.elapsed().as_secs_f64());
-        }
-    });
+    let (bg_qps, bg_fut) = {
+        let _g = rt.enter();
+        let feed = feeder.clone();
+        let bg_qps = rt.spawn(async move {
+            let mut prev = 0;
+            loop {
+                let i = std::time::Instant::now();
+                tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+                let c = iss_acc.load(std::sync::atomic::Ordering::SeqCst) * STEP;
+                let d = (c - prev) as f64 / 5.0;
+                prev = c;
+                println!("QPS {}", d / i.elapsed().as_secs_f64());
+            }
+        });
+        let bg_fut = rt.spawn(background_update(feed));
+        (bg_qps, bg_fut)
+    };
 
     let thread_count = Arc::new(AtomicUsize::new(0));
     let thread_count_c = thread_count.clone();
@@ -416,7 +417,6 @@ fn main() {
     //     .enable_all()
     //     .build()
     //     .unwrap();
-    let _g2 = rt.enter();
     let f2 = Arc::new(AtomicBool::new(false));
     let tvs = iss.start(args.tasks, &rt2, f2.clone());
 
