@@ -8,7 +8,7 @@ use std::{
     default,
     fs::File,
     future::Future,
-    io::{self, BufRead, BufReader},
+    io::{self, BufRead, BufReader, Write},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize},
         Arc, RwLock,
@@ -195,7 +195,7 @@ impl Sampler<String> for PKSampler {
             if c < n {
                 res.push(s);
             } else {
-                let survive = n as f64 / c as f64;
+                let survive = n as f64 / c as f64; // growing smaller
                 let mut rng = rand::thread_rng();
                 let random_float: f64 = rng.gen_range(0.0..1.0);
                 if random_float > survive {
@@ -380,6 +380,49 @@ fn ctrl_channel() -> std::result::Result<Receiver<()>, ctrlc::Error> {
     })?;
 
     Ok(receiver)
+}
+
+#[test]
+fn test_pk_sampler() {
+    let mut temps = vec![];
+    let mut file_names = vec![];
+    let distinct = 4;
+    let count = 1000;
+    let check_count = 10000;
+    for i in 0..distinct {
+        let temp = tempfile::Builder::new()
+            .prefix("f")
+            .suffix(".txt")
+            .tempfile()
+            .unwrap();
+        let s = String::from(temp.path().to_str().unwrap());
+        let mut file = File::create(temp.path()).unwrap();
+        for j in 0..count {
+            file.write_all(format!("{}\n", i).as_bytes()).unwrap();
+        }
+        temps.push(temp);
+        file_names.push(s);
+    }
+    println!("file_names {:?}", file_names);
+    let pk = PKSampler { file_names };
+    let mut x = vec![];
+    for i in 0..check_count {
+        let mut z = pk.sample(1, false);
+        x.append(&mut z);
+    }
+    let mut m: HashMap<String, usize> = Default::default();
+    for i in x.iter() {
+        if m.contains_key(i) {
+            *m.get_mut(i).unwrap() += 1;
+        } else {
+            m.insert(i.clone(), 1);
+        }
+    }
+    println!("m {:?}", m);
+    let low = check_count / (distinct + 1);
+    for (k, v) in m.iter() {
+        assert!(v > &low)
+    }
 }
 
 /// Consider b regions and k samples, then estimation of coverred regions is b * (1 - ((b - 1) / b) ** k).

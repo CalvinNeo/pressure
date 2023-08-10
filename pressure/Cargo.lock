@@ -1458,6 +1458,7 @@ dependencies = [
  "mysql",
  "mysql_async",
  "rand",
+ "tempfile",
  "threadpool",
  "tokio",
 ]

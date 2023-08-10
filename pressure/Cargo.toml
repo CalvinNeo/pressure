@@ -17,6 +17,7 @@ ctrlc = "3.4.0"
 tokio = { version = "1.5", features = ["time", "rt", "net", "sync", "rt-multi-thread"]}
 itertools = "0.10"
 futures = "0.3"
+tempfile = "3.0"
 
 [profile.release]
 debug = true
