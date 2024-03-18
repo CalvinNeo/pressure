@@ -15,7 +15,7 @@ use std::{
     },
 };
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use crossbeam_channel::{bounded, select, Receiver};
 use feeder::*;
 use issuer::*;
@@ -67,13 +67,28 @@ impl Sampler<String> for PKSampler {
     }
 }
 
-/// Simple program to greet a person
 #[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+struct GlobalArgs {
+    #[clap(subcommand)]
+    commands: Commands,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    PKIssue(PKIssueArgs),
+    Test(TestArgs),
+}
+
+/// Simple program to greet a person
+#[derive(Args, Debug)]
+#[command(author, version, about, long_about = None)]
+struct TestArgs {}
+
+/// Simple program to greet a person
+#[derive(Args, Debug)]
 #[command(author, version, about, long_about = None)]
 struct PKIssueArgs {
-    #[arg(short, long)]
-    mode: String,
-
     /// TiDB endpoints splitted by `,`, like mysql://root@127.0.0.1:4000/
     #[arg(short, long)]
     tidb_addrs: String,
@@ -169,8 +184,7 @@ fn test_pk_sampler() {
 /// ./target/release/pressure --tidb-addrs mysql://root@172.31.7.1:4000/,mysql://root@172.31.7.2:4000/,mysql://root@172.31.7.3:4000/,mysql://root@172.31.7.4:4000/ --input-files /home/ubuntu/tiflash-u2/pk_0,/home/ubuntu/tiflash-u2/pk_1,/home/ubuntu/tiflash-u2/pk_2,/home/ubuntu/tiflash-u2/pk_3,/home/ubuntu/tiflash-u2/pk_4,/home/ubuntu/tiflash-u2/pk_5 -s 5000000 --update-interval-millis 5000 --batch-size 1 --slot-count 50 --workers 100
 /// ./target/debug/pressure --tidb-addrs mysql://root@127.0.0.1:4000/ --input-files /Users/calvin/pressure/pressure/a,/Users/calvin/pressure/pressure/b,/Users/calvin/pressure/pressure/c -s 1 --update-interval-millis 100 --slot-count 1
 
-fn main() {
-    let args = PKIssueArgs::parse();
+fn pk_issue_main(args: PKIssueArgs) {
     let file_names = args.input_files.split(',').map(|e| e.to_string()).collect();
     let pk = PKSampler { file_names };
     let feeder: Arc<Feeder<String>> = Arc::new(Feeder::new(
@@ -253,5 +267,15 @@ fn main() {
                 break;
             }
         }
+    }
+}
+
+fn main() {
+    let args = GlobalArgs::parse();
+    match args.commands {
+        Commands::PKIssue(a) => {
+            pk_issue_main(a);
+        }
+        Commands::Test(a) => {}
     }
 }
