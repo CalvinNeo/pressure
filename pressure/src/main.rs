@@ -4,15 +4,17 @@
 
 mod feeder;
 mod issuer;
+mod util;
 use std::{
+    collections::HashMap,
     fs::File,
-    io::{self, BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Write},
     sync::{
         atomic::{AtomicBool, AtomicUsize},
         Arc,
     },
 };
-use std::collections::HashMap;
+
 use clap::Parser;
 use crossbeam_channel::{bounded, select, Receiver};
 use feeder::*;
@@ -21,27 +23,17 @@ use issuer::*;
 use mysql_async::prelude::*;
 use rand::Rng;
 use tokio::runtime::Runtime;
+use util::*;
 
 struct PKSampler {
     file_names: Vec<String>,
-}
-
-fn read_lines_lazy(file_path: &str) -> impl Iterator<Item = io::Result<String>> {
-    let file = File::open(file_path).unwrap();
-    let reader = BufReader::new(file);
-    reader.lines().map(|line| {
-        line.map(|l| {
-            let v: Vec<String> = l.trim().split(' ').take(1).map(|e| e.to_string()).collect();
-            v.into_iter().next().unwrap()
-        })
-    })
 }
 
 impl Sampler<String> for PKSampler {
     fn sample(&self, n: usize, should_print: bool) -> Vec<String> {
         // Reservoir Sampling
         let mut res: Vec<String> = vec![];
-        let mut iter_set: Vec<Box<dyn Iterator<Item = io::Result<String>>>> = vec![];
+        let mut iter_set: Vec<Box<dyn Iterator<Item = std::io::Result<String>>>> = vec![];
 
         for i in self.file_names.iter() {
             iter_set.push(Box::new(read_lines_lazy(i.as_str())));
