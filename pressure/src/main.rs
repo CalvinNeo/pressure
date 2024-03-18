@@ -2,11 +2,8 @@
 #![feature(iter_array_chunks)]
 #![feature(async_closure)]
 
-mod issuer;
 mod feeder;
-use issuer::*;
-use feeder::*;
-
+mod issuer;
 use std::{
     fs::File,
     io::{self, BufRead, BufReader, Write},
@@ -16,17 +13,14 @@ use std::{
     },
 };
 use std::collections::HashMap;
-
 use clap::Parser;
-
 use crossbeam_channel::{bounded, select, Receiver};
-
+use feeder::*;
+use issuer::*;
 // use mysql::{prelude::*, *};
-use mysql_async::{prelude::*};
-use rand::{Rng};
-
-use tokio::{runtime::Runtime};
-
+use mysql_async::prelude::*;
+use rand::Rng;
+use tokio::runtime::Runtime;
 
 struct PKSampler {
     file_names: Vec<String>,
