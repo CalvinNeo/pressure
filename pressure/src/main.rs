@@ -2,162 +2,31 @@
 #![feature(iter_array_chunks)]
 #![feature(async_closure)]
 
+mod issuer;
+mod feeder;
+use issuer::*;
+use feeder::*;
+
 use std::{
-    borrow::BorrowMut,
-    collections::HashMap,
-    default,
     fs::File,
-    future::Future,
     io::{self, BufRead, BufReader, Write},
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize},
-        Arc, RwLock,
+        atomic::{AtomicBool, AtomicUsize},
+        Arc,
     },
-    thread::{self, JoinHandle},
 };
+use std::collections::HashMap;
 
 use clap::Parser;
-use crossbeam::epoch::Atomic;
+
 use crossbeam_channel::{bounded, select, Receiver};
-use itertools::Itertools;
+
 // use mysql::{prelude::*, *};
-use mysql_async::{prelude::*, *};
-use rand::{prelude::IteratorRandom, Rng};
-use threadpool::ThreadPool;
-use tokio::{runtime::Runtime, sync::oneshot};
+use mysql_async::{prelude::*};
+use rand::{Rng};
 
-const STEP: u64 = 20;
+use tokio::{runtime::Runtime};
 
-trait Sampler<T: Clone + Sync>: Send + Sync {
-    fn sample(&self, n: usize, _: bool) -> Vec<T>;
-}
-struct Slot<T: Clone + Sync> {
-    items: Vec<T>,
-}
-
-unsafe impl<T: Clone + Sync> Send for Slot<T> {}
-
-impl<T: Clone + Sync> Default for Slot<T> {
-    fn default() -> Self {
-        Slot { items: vec![] }
-    }
-}
-
-impl<T: Clone + Sync> Slot<T> {
-    fn new(sampler: Arc<dyn Sampler<T>>, size: usize) -> Slot<T> {
-        let mut s = Slot::default();
-        s.items.append(&mut sampler.sample(size, false));
-        s
-    }
-
-    fn new_with_prefetched(prefetched: Vec<T>) -> Slot<T> {
-        let mut s = Slot::default();
-        let mut prefetched = prefetched;
-        s.items.append(&mut prefetched);
-        s
-    }
-
-    fn sample(&self, n: usize) -> Vec<T> {
-        assert!(n <= self.items.len());
-        let mut rng = rand::thread_rng();
-        let mut v: Vec<T> = vec![];
-        // We don't use iter().choose_multiple() since it is O(n).
-        v.reserve(n);
-        for i in 0..n {
-            let j: usize = rng.gen_range(0usize..self.items.len());
-            v.push(self.items[j].clone());
-        }
-        v
-    }
-}
-
-struct Feeder<T: Clone + Sync> {
-    slot_count: usize,
-    slot_size: usize,
-    slots: Vec<RwLock<Slot<T>>>,
-    sampler: Arc<dyn Sampler<T>>,
-    update_millis: u64,
-}
-
-unsafe impl<T: Clone + Sync> Send for Feeder<T> {}
-
-impl<T: Clone + Sync + 'static> Feeder<T> {
-    fn new(
-        slot_count: usize,
-        slot_size: usize,
-        sampler: Arc<dyn Sampler<T>>,
-        update_millis: u64,
-    ) -> Self {
-        let mut feeder = Feeder {
-            slot_count,
-            slot_size,
-            slots: vec![],
-            sampler,
-            update_millis,
-        };
-        for _i in 0..slot_count {
-            feeder.slots.push(RwLock::new(Slot::default()));
-        }
-        let expect_len = slot_count * slot_size;
-        println!("start prefetch of total {}", expect_len);
-        let prefetched: Vec<T> = feeder.sampler.as_ref().sample(expect_len, true);
-        println!("finished prefetch of total {}", prefetched.len());
-        let mut iter = prefetched.into_iter();
-        for i in 0..slot_count {
-            println!("start create slot {}", i);
-            let mut v: Vec<T> = vec![];
-            v.reserve(slot_size);
-            for _j in 0..slot_size {
-                v.push(iter.next().unwrap());
-            }
-            let slot = Slot::new_with_prefetched(v);
-            *feeder.slots[i].write().expect("update lock error") = slot;
-        }
-        feeder
-    }
-
-    fn update_cell(&self, i: usize) -> usize {
-        let slot_size = self.slot_size.clone();
-        let sampler = self.sampler.clone();
-        let slot = Slot::new(sampler, slot_size);
-        let size = slot.items.len();
-        *self.slots[i].write().expect("update lock error") = slot;
-        size
-    }
-
-    fn sample(&self, n: usize) -> Vec<T> {
-        let mut rng = rand::thread_rng();
-        let slot_id: usize = rng.gen_range(0usize..self.slot_count);
-        // We don't sample more than a slots's maximum items.
-        assert!(n <= self.slot_count);
-        self.slots[slot_id]
-            .read()
-            .expect("read lock error")
-            .sample(n)
-    }
-}
-
-async fn background_update<T: Clone + Sync + 'static>(feeder: Arc<Feeder<T>>) {
-    let update_millis = feeder.update_millis.clone();
-    let mut rng = rand::thread_rng();
-    loop {
-        let slot_id: usize = rng.gen_range(0usize..feeder.slot_count);
-        let now = std::time::Instant::now();
-        println!(
-            "start update slot {} [thread_id={:?}]",
-            slot_id,
-            std::thread::current().id()
-        );
-        let new_size = feeder.update_cell(slot_id);
-        println!(
-            "end update slot {} elapsed millis {} new_size {}",
-            slot_id,
-            now.elapsed().as_millis(),
-            new_size
-        );
-        thread::sleep(std::time::Duration::from_millis(update_millis));
-    }
-}
 
 struct PKSampler {
     file_names: Vec<String>,
@@ -168,8 +37,8 @@ fn read_lines_lazy(file_path: &str) -> impl Iterator<Item = io::Result<String>> 
     let reader = BufReader::new(file);
     reader.lines().map(|line| {
         line.map(|l| {
-            let v: Vec<String> = l.trim().split(" ").take(1).map(|e| e.to_string()).collect();
-            v.into_iter().nth(0).unwrap()
+            let v: Vec<String> = l.trim().split(' ').take(1).map(|e| e.to_string()).collect();
+            v.into_iter().next().unwrap()
         })
     })
 }
@@ -212,128 +81,13 @@ impl Sampler<String> for PKSampler {
     }
 }
 
-struct MySQLIssuer {
-    urls: Vec<String>,
-    feeder: Arc<Feeder<String>>,
-    dry_run: bool,
-    acc: Arc<AtomicU64>,
-    no_print_data: bool,
-    batch_size: u64,
-}
-
-impl MySQLIssuer {
-    fn new(
-        urls: Vec<String>,
-        feeder: Arc<Feeder<String>>,
-        dry_run: bool,
-        no_print_data: bool,
-        batch_size: u64,
-    ) -> Self {
-        let r = Self {
-            urls: urls.clone(),
-            feeder,
-            dry_run,
-            acc: Arc::new(AtomicU64::new(0)),
-            no_print_data,
-            batch_size,
-        };
-        r
-    }
-
-    fn start(
-        &self,
-        n_threads: usize,
-        rt: &Runtime,
-        finished: Arc<AtomicBool>,
-    ) -> Vec<tokio::task::JoinHandle<()>> {
-        let _g2 = rt.enter();
-        let mut rv: Vec<tokio::task::JoinHandle<()>> = vec![];
-        for thid in 0..n_threads {
-            let thread_id = thid.clone();
-            let urls = self.urls.clone();
-            let feeder = self.feeder.clone();
-            let dry_run = self.dry_run.clone();
-            let no_print_data = self.no_print_data.clone();
-            let acc = self.acc.clone();
-            let batch_size = self.batch_size.clone();
-            let finished = finished.clone();
-            let f = async move || {
-                let mut count = 0;
-                let mut pools: Vec<Pool> = vec![];
-                if !dry_run {
-                    for url in urls.iter() {
-                        let pool = Pool::new(url.as_str());
-                        pools.push(pool);
-                    }
-                }
-                let mut total_elapsed: u128 = 0;
-                let mut total_elapsed_count: usize = 0;
-                loop {
-                    if finished.load(std::sync::atomic::Ordering::SeqCst) {
-                        for pool in pools.into_iter() {
-                            pool.disconnect().await;
-                        }
-                        break;
-                    }
-                    let (s, tidb_id) = {
-                        // let mut rng_inner = tokio::sync::RwLock::new(rand::thread_rng());
-                        // let rng = rng_inner.read().await;
-                        let mut rng = rand::thread_rng();
-                        let tidb_id: usize = rng.gen_range(0usize..urls.len());
-                        // Let's create a table for payments.
-                        let random_string: String =
-                            (0..5).map(|_| rng.gen_range(b'a'..=b'z') as char).collect();
-                        (Iterator::intersperse(feeder.sample(batch_size as usize).into_iter().map(|e| {
-                            format!("update rtdb.zto_ssmx_bill_detail set forecast_stat_day = '{}' where bill_code='{}';", random_string, e)
-                        }), "\n".to_string()).collect(), tidb_id)
-                    };
-                    if dry_run {
-                        if !no_print_data {
-                            println!(
-                                "task_id {} tidb_id {} sql {} [thread_id={:?}]",
-                                thread_id,
-                                tidb_id,
-                                s,
-                                std::thread::current().id()
-                            );
-                        }
-                    } else {
-                        let start = std::time::Instant::now();
-                        let s: String = s;
-                        let mut conn = pools[tidb_id].get_conn().await.unwrap();
-                        conn.query_drop(s).await.unwrap();
-                        drop(conn);
-                        total_elapsed += start.elapsed().as_millis();
-                        total_elapsed_count += 1;
-                    }
-                    count += 1;
-                    if count % 2000 == 0 {
-                        println!(
-                            "task_id {} finished {} average delay {} [thread_id={:?}]",
-                            thread_id,
-                            count,
-                            total_elapsed as f64 / total_elapsed_count as f64,
-                            std::thread::current().id()
-                        );
-                        total_elapsed = 0;
-                        total_elapsed_count = 0;
-                    }
-                    if count % STEP == 0 {
-                        acc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    }
-                }
-                ()
-            };
-            rv.push(rt.spawn(f()));
-        }
-        rv
-    }
-}
-
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct PKIssueArgs {
+    #[arg(short, long)]
+    mode: String,
+
     /// TiDB endpoints splitted by `,`, like mysql://root@127.0.0.1:4000/
     #[arg(short, long)]
     tidb_addrs: String,
@@ -397,7 +151,7 @@ fn test_pk_sampler() {
             .unwrap();
         let s = String::from(temp.path().to_str().unwrap());
         let mut file = File::create(temp.path()).unwrap();
-        for j in 0..count {
+        for _j in 0..count {
             file.write_all(format!("{}\n", i).as_bytes()).unwrap();
         }
         temps.push(temp);
@@ -406,7 +160,7 @@ fn test_pk_sampler() {
     println!("file_names {:?}", file_names);
     let pk = PKSampler { file_names };
     let mut x = vec![];
-    for i in 0..check_count {
+    for _i in 0..check_count {
         let mut z = pk.sample(1, false);
         x.append(&mut z);
     }
@@ -420,7 +174,7 @@ fn test_pk_sampler() {
     }
     println!("m {:?}", m);
     let low = check_count / (distinct + 1);
-    for (k, v) in m.iter() {
+    for (_k, v) in m.iter() {
         assert!(v > &low)
     }
 }
@@ -431,7 +185,7 @@ fn test_pk_sampler() {
 
 fn main() {
     let args = PKIssueArgs::parse();
-    let file_names = args.input_files.split(",").map(|e| e.to_string()).collect();
+    let file_names = args.input_files.split(',').map(|e| e.to_string()).collect();
     let pk = PKSampler { file_names };
     let feeder: Arc<Feeder<String>> = Arc::new(Feeder::new(
         args.slot_count,
@@ -439,7 +193,7 @@ fn main() {
         Arc::new(pk),
         args.update_interval_millis,
     ));
-    let addrs: Vec<String> = args.tidb_addrs.split(",").map(|e| e.to_string()).collect();
+    let addrs: Vec<String> = args.tidb_addrs.split(',').map(|e| e.to_string()).collect();
     let iss: MySQLIssuer = MySQLIssuer::new(
         addrs,
         feeder.clone(),
@@ -451,7 +205,7 @@ fn main() {
     let iss_acc = iss.acc.clone();
     let (bg_qps, bg_fut) = {
         let _g = rt.enter();
-        let feed = feeder.clone();
+        let feed = feeder;
         let bg_qps = rt.spawn(async move {
             let mut prev = 0;
             loop {
