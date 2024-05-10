@@ -100,11 +100,11 @@ struct PKIssueArgs {
     #[arg(short, long)]
     input_files: String,
 
-    /// MySQL workers.
+    /// MySQL workers. Namely threads
     #[arg(short, long, default_value_t = 7)]
     workers: usize,
 
-    /// MySQL tasks.
+    /// MySQL tasks. Namely coroutines.
     #[arg(long, default_value_t = 7)]
     tasks: usize,
 
