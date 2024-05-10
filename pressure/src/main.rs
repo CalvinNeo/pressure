@@ -4,6 +4,7 @@
 
 mod feeder;
 mod issuer;
+mod free_issuer;
 mod util;
 use std::{
     collections::HashMap,
@@ -19,6 +20,7 @@ use clap::{Args, Parser, Subcommand};
 use crossbeam_channel::{bounded, select, Receiver};
 use feeder::*;
 use issuer::*;
+use free_issuer::*;
 // use mysql::{prelude::*, *};
 use mysql_async::prelude::*;
 use rand::Rng;
@@ -76,6 +78,7 @@ struct GlobalArgs {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    FreeIssue(FreeIssueArgs),
     PKIssue(PKIssueArgs),
     Test(TestArgs),
 }
@@ -120,6 +123,33 @@ struct PKIssueArgs {
     /// How many items in one slot.
     #[arg(short, long)]
     slot_size: usize,
+
+    #[arg(long, default_value_t = false)]
+    no_print_data: bool,
+
+    #[arg(long, default_value_t = 1)]
+    batch_size: u64,
+}
+
+/// Simple program to greet a person
+#[derive(Args, Debug)]
+#[command(author, version, about, long_about = None)]
+struct FreeIssueArgs {
+    /// TiDB endpoints splitted by `,`, like mysql://root@127.0.0.1:4000/
+    #[arg(short, long)]
+    tidb_addrs: String,
+
+    /// MySQL workers.
+    #[arg(short, long, default_value_t = 7)]
+    workers: usize,
+
+    /// MySQL tasks.
+    #[arg(long, default_value_t = 7)]
+    tasks: usize,
+
+    /// Perform dry run
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
 
     #[arg(long, default_value_t = false)]
     no_print_data: bool,
@@ -270,6 +300,83 @@ fn pk_issue_main(args: PKIssueArgs) {
     }
 }
 
+
+// ./target/release/pressure free-issue --tidb-addrs mysql://root@172.31.7.1:4000/,mysql://root@172.31.7.2:4000/,mysql://root@172.31.7.3:4000/,mysql://root@172.31.7.4:4000/ --batch-size 1 --workers 10 --dry-run
+fn free_issue_main(args: FreeIssueArgs) {
+    let addrs: Vec<String> = args.tidb_addrs.split(',').map(|e| e.to_string()).collect();
+    let iss: FreeIssuer = FreeIssuer::new(
+        addrs,
+        args.dry_run,
+        args.no_print_data,
+        args.batch_size,
+    );
+    let rt = Runtime::new().unwrap();
+    let iss_acc = iss.acc.clone();
+    let bg_qps = {
+        let _g = rt.enter();
+        let bg_qps = rt.spawn(async move {
+            let mut prev = 0;
+            loop {
+                let i = std::time::Instant::now();
+                tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+                let c = iss_acc.load(std::sync::atomic::Ordering::SeqCst) * STEP;
+                let d = (c - prev) as f64 / 5.0;
+                prev = c;
+                println!(
+                    "QPS {} [thread_id={:?}]",
+                    d / i.elapsed().as_secs_f64(),
+                    std::thread::current().id()
+                );
+            }
+        });
+        bg_qps
+    };
+
+    let thread_count = Arc::new(AtomicUsize::new(0));
+    let thread_count_c = thread_count.clone();
+    let rt2 = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.workers)
+        .enable_all()
+        .on_thread_start(move || {
+            thread_count_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .thread_name("issuer")
+        .build()
+        .unwrap();
+    /// The following not works.
+    // let rt2 = tokio::runtime::Builder::new_current_thread()
+    //     .enable_all()
+    //     .build()
+    //     .unwrap();
+    let f2 = Arc::new(AtomicBool::new(false));
+    let tvs = iss.start(args.tasks, &rt2, f2.clone());
+
+    println!(
+        "====== task count {} exes {} =====",
+        tvs.len(),
+        thread_count.load(std::sync::atomic::Ordering::SeqCst)
+    );
+
+    let ctrl_c_events = ctrl_channel().unwrap();
+    loop {
+        select! {
+            recv(ctrl_c_events) -> _ => {
+                println!("Goodbye!");
+                f2.store(true, std::sync::atomic::Ordering::SeqCst);
+                bg_qps.abort();
+                for k in tvs.into_iter() {
+                    rt2.block_on(k);
+                }
+                rt.shutdown_timeout(std::time::Duration::from_millis(1));
+                rt2.shutdown_timeout(std::time::Duration::from_millis(1));
+                println!("Quit!");
+                break;
+            }
+        }
+    }
+}
+
+
 fn main() {
     let args = GlobalArgs::parse();
     match args.commands {
@@ -277,5 +384,8 @@ fn main() {
             pk_issue_main(a);
         }
         Commands::Test(a) => {}
+        Commands::FreeIssue(a) => {
+            free_issue_main(a)
+        }
     }
 }
