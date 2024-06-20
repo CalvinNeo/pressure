@@ -2,7 +2,6 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64},
     Arc,
 };
-
 // use mysql::{prelude::*, *};
 use mysql_async::{prelude::*, *};
 use rand::Rng;
@@ -57,7 +56,12 @@ impl FreeIssuer {
                 let mut pools: Vec<Pool> = vec![];
                 if !dry_run {
                     for url in urls.iter() {
-                        let pool = Pool::new(url.as_str());
+                        let cert_path = std::path::Path::new("/etc/ssl/cert.pem");
+                        let ssl_opts = SslOpts::default().with_root_cert_path(Some(cert_path));
+                        // let pool_opt = PoolOpts::new().ssl_opts(ssl_opts);
+                        let ori_opts = Opts::from_url(url).unwrap();
+                        let opts = OptsBuilder::from_opts(ori_opts).ssl_opts(ssl_opts);
+                        let pool = Pool::new(opts);
                         pools.push(pool);
                     }
                 }

@@ -135,7 +135,7 @@ struct PKIssueArgs {
 #[derive(Args, Debug)]
 #[command(author, version, about, long_about = None)]
 struct FreeIssueArgs {
-    /// TiDB endpoints splitted by `,`, like mysql://root@127.0.0.1:4000/
+    /// TiDB endpoints splitted by `,`, like mysql://root@127.0.0.1:4000/, mysql://root:password@127.0.0.1:4000/
     #[arg(short, long)]
     tidb_addrs: String,
 
@@ -301,7 +301,7 @@ fn pk_issue_main(args: PKIssueArgs) {
 }
 
 
-// ./target/release/pressure free-issue --tidb-addrs mysql://root@172.31.7.1:4000/,mysql://root@172.31.7.2:4000/,mysql://root@172.31.7.3:4000/,mysql://root@172.31.7.4:4000/ --batch-size 1 --workers 10 --dry-run
+// ./target/release/pressure free-issue --tidb-addrs mysql://root@172.31.7.1:4000/,mysql://root@172.31.7.2:4000/,mysql://root@172.31.7.3:4000/,mysql://root@172.31.7.4:4000/ --batch-size 1 --workers 8 --tasks 100 --dry-run
 fn free_issue_main(args: FreeIssueArgs) {
     let addrs: Vec<String> = args.tidb_addrs.split(',').map(|e| e.to_string()).collect();
     let iss: FreeIssuer = FreeIssuer::new(
